@@ -106,17 +106,82 @@ class StableDiffusion(nn.Module):
         ) / batch_size
 
         return loss
-    
-    
+
     def get_pds_loss(
-        self, src_latents, tgt_latents, 
-        src_text_embedding, tgt_text_embedding,
-        guidance_scale=7.5, 
-        grad_scale=1,
+            self, src_latents, tgt_latents,
+            src_text_embedding, tgt_text_embedding,
+            guidance_scale=7.5,
+            grad_scale=1,
     ):
-        
-        # TODO: Implement the loss function for PDS
-        raise NotImplementedError("PDS is not implemented yet.")
+        batch_size = tgt_latents.shape[0]
+        device = tgt_latents.device
+
+        # sample timestep t, and use t-1 as the previous denoising step
+        t = torch.randint(
+            self.min_step + 1,
+            self.max_step + 1,
+            (batch_size,),
+            dtype=torch.long,
+            device=device,
+        )
+        t_prev = t - 1
+
+        # shared noises for source and target
+        noise_t = torch.randn_like(tgt_latents)
+        noise_prev = torch.randn_like(tgt_latents)
+
+        # x_t and x_{t-1} for source and target, using shared noise
+        src_xt = self.scheduler.add_noise(src_latents, noise_t, t)
+        tgt_xt = self.scheduler.add_noise(tgt_latents, noise_t, t)
+
+        src_xt_prev = self.scheduler.add_noise(src_latents, noise_prev, t_prev)
+        tgt_xt_prev = self.scheduler.add_noise(tgt_latents, noise_prev, t_prev)
+
+        # predict eps_theta(x_t, t, c)
+        with torch.no_grad():
+            src_eps = self.get_noise_preds(
+                src_xt,
+                t,
+                src_text_embedding,
+                guidance_scale=guidance_scale,
+            )
+
+            tgt_eps = self.get_noise_preds(
+                tgt_xt,
+                t,
+                tgt_text_embedding,
+                guidance_scale=guidance_scale,
+            )
+
+        def compute_z(x_t, x_t_prev, eps_pred, t, t_prev):
+            alpha_t = self.alphas[t].view(batch_size, 1, 1, 1)
+            alpha_prev = self.alphas[t_prev].view(batch_size, 1, 1, 1)
+
+            beta_t = 1.0 - alpha_t
+            beta_prev = 1.0 - alpha_prev
+
+            # predicted x_0 from x_t
+            pred_x0 = (x_t - beta_t.sqrt() * eps_pred) / alpha_t.sqrt()
+
+            # DDIM/DDPM-style mean for x_{t-1}
+            mu = alpha_prev.sqrt() * pred_x0 + beta_prev.sqrt() * eps_pred
+
+            # stochastic latent z
+            sigma = beta_prev.sqrt()
+            z = (x_t_prev - mu) / (sigma + 1e-8)
+
+            return z
+
+        src_z = compute_z(src_xt, src_xt_prev, src_eps, t, t_prev).detach()
+        tgt_z = compute_z(tgt_xt, tgt_xt_prev, tgt_eps, t, t_prev)
+
+        loss = torch.nn.functional.mse_loss(
+            tgt_z.float(),
+            src_z.float(),
+            reduction="mean",
+        )
+
+        return grad_scale * loss
     
     
     @torch.no_grad()
