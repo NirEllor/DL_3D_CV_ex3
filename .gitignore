@@ -1,0 +1,7 @@
+hw3/
+__pycache__/
+.idea/
+.vscode/
+outputs/
+*.pt
+*.pth
